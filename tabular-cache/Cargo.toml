@@ -1,0 +1,8 @@
+[package]
+name = "tabular-cache"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { workspace = true }
+arrow = { workspace = true }

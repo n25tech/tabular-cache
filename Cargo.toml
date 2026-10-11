@@ -1,0 +1,8 @@
+[workspace]
+members = ["yfinance-ohlc-example", "tabular-cache"]
+resolver = "3"
+
+# Shared dependencies across all crates (optional, minimizes version drift)
+[workspace.dependencies]
+arrow = "60.0.0"
+chrono = "0.4.45"
