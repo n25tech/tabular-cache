@@ -16,14 +16,19 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 /// Persists one table per ticker. Implement this to add a new storage format or backend.
 pub trait CacheStore: Send + Sync {
+    /// Returns the ticker's table, or `None` if nothing has been written for it.
     fn read(&self, ticker: &str) -> Result<Option<RecordBatch>, ArrowError>;
+    /// Replaces the ticker's table. `batch` is always the whole table, not only new rows.
     fn write(&self, ticker: &str, batch: &RecordBatch) -> Result<(), ArrowError>;
 
     /// Days the source was asked about and had no data for (e.g. exchange holidays).
+    /// Returns an empty set if none have been written.
     fn read_empty_days(&self, ticker: &str) -> Result<BTreeSet<NaiveDate>, ArrowError>;
+    /// Replaces the ticker's recorded empty days.
     fn write_empty_days(&self, ticker: &str, days: &BTreeSet<NaiveDate>) -> Result<(), ArrowError>;
 }
 
+/// The file format a [`FileCacheStore`] writes tables in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileFormat {
     /// Column types come from the store's column types (see [`FileCacheStore::with_column_types`]);
@@ -42,6 +47,7 @@ impl FileFormat {
     }
 }
 
+/// Keeps tables in memory for the life of the store. Useful for tests.
 #[derive(Default)]
 pub struct InMemoryCacheStore {
     tables: Mutex<HashMap<String, RecordBatch>>,
@@ -80,6 +86,12 @@ impl CacheStore for InMemoryCacheStore {
     }
 }
 
+/// Keeps each ticker's table in `<dir>/<ticker>.<csv|parquet>` and its empty days in
+/// `<dir>/<ticker>.empty-days` (one ISO date per line).
+///
+/// Files are written to a temporary file and renamed into place, so an interrupted write never
+/// leaves a partial file. Tickers that could escape `dir` (empty, `.`, `..`, or containing `/` or
+/// `\`) are rejected.
 pub struct FileCacheStore {
     dir: PathBuf,
     format: FileFormat,
@@ -87,6 +99,7 @@ pub struct FileCacheStore {
 }
 
 impl FileCacheStore {
+    /// Creates a store in `dir`, which is created on first write.
     /// CSV columns named in [`crate::ohlc_schema`] are read with those types.
     pub fn new(dir: impl Into<PathBuf>, format: FileFormat) -> Self {
         Self {

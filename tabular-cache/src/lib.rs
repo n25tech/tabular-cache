@@ -1,3 +1,29 @@
+//! A local cache for daily time-series tables stored as Arrow [`RecordBatch`]es.
+//!
+//! A [`Cache`] combines a [`CacheStore`] (where tables are kept) with a [`TimeseriesFetcher`]
+//! (where missing data comes from). [`Cache::get_timeseries_data`] returns the requested range,
+//! fetching only the trading days that are not cached yet.
+//!
+//! ```no_run
+//! # use tabular_cache::*;
+//! # struct MyApi;
+//! # impl TimeseriesFetcher for MyApi {
+//! #     fn fetch(&self, _: &str, _: chrono::DateTime<chrono::Utc>, _: chrono::DateTime<chrono::Utc>)
+//! #         -> Result<arrow::array::RecordBatch, arrow::error::ArrowError> { unimplemented!() }
+//! # }
+//! use chrono::{Duration, Utc};
+//!
+//! let cache = Cache::new(
+//!     Box::new(FileCacheStore::new("data/cache", FileFormat::Parquet)),
+//!     Box::new(MyApi),
+//! );
+//! let end = Utc::now();
+//! let batch = cache.get_timeseries_data("AAPL", end - Duration::days(30), end, FetchAction::Missing)?;
+//! # Ok::<(), arrow::error::ArrowError>(())
+//! ```
+//!
+//! See the repository README for a full guide, including the rules a fetcher must follow.
+
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
@@ -13,11 +39,16 @@ mod store;
 pub use fetcher::TimeseriesFetcher;
 pub use store::{CacheStore, FileCacheStore, FileFormat, InMemoryCacheStore};
 
+/// The column every cached table is keyed on. It must be a non-null `Date32` column.
 pub const DATE_COLUMN: &str = "date";
 
 /// Missing runs separated by at most this many cached trading days are fetched as one request.
 pub const DEFAULT_COALESCE_GAP: usize = 5;
 
+/// A ready-made daily price schema: `date`, `ticker`, `open`, `high`, `low`, `close`.
+///
+/// Fetchers may return any schema with a [`DATE_COLUMN`], but this is what an empty result
+/// uses and what [`FileCacheStore`] reads CSV columns as by default.
 pub fn ohlc_schema() -> Schema {
     Schema::new(vec![
         Field::new(DATE_COLUMN, DataType::Date32, false),
@@ -29,6 +60,7 @@ pub fn ohlc_schema() -> Schema {
     ])
 }
 
+/// How [`Cache::get_timeseries_data`] decides what to fetch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchAction {
     /// Fetch the whole requested range, replacing any cached rows for those dates.
@@ -38,6 +70,9 @@ pub enum FetchAction {
     Missing,
 }
 
+/// Serves date ranges per ticker from a [`CacheStore`], filling gaps from a [`TimeseriesFetcher`].
+///
+/// A trading day is any weekday; weekends are never fetched.
 pub struct Cache {
     store: Box<dyn CacheStore>,
     fetcher: Box<dyn TimeseriesFetcher>,
@@ -46,6 +81,7 @@ pub struct Cache {
 }
 
 impl Cache {
+    /// Creates a cache with the [`DEFAULT_COALESCE_GAP`].
     pub fn new(store: Box<dyn CacheStore>, fetcher: Box<dyn TimeseriesFetcher>) -> Self {
         Self {
             store,
@@ -266,6 +302,11 @@ fn slice_range(batch: &RecordBatch, start: NaiveDate, end: NaiveDate) -> Result<
         .collect();
     filter_record_batch(batch, &BooleanArray::from(keep))
 }
+
+/// Runs the README's code examples as doctests, so they stay in step with the API.
+#[cfg(doctest)]
+#[doc = include_str!("../../README.md")]
+struct ReadmeDoctests;
 
 #[cfg(test)]
 mod tests {
