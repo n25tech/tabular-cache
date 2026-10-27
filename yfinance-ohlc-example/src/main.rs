@@ -1,43 +1,23 @@
-use chrono::{DateTime, Utc};
-use std::sync::Arc;
-use tabular_cache;
-
-use arrow::array::{ArrayRef, Float64Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::error::ArrowError;
+use chrono::{Duration, Utc};
+use tabular_cache::{Cache, FetchAction, FileCacheStore, FileFormat};
 
 mod yfinance;
 
-fn fetch_yfinance_data(
-    start_date: DateTime<Utc>,
-    end_date: DateTime<Utc>,
-    ticker: &str,
-) -> Result<RecordBatch, ArrowError> {
+use yfinance::YFinanceFetcher;
 
-    let ticker_symbol = "IDFCFIRSTB.NS";
-    yfinance::get_nse_equity_for_ticker(ticker_symbol);
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let symbol = "IDFCFIRSTB.NS";
+    let end = Utc::now();
+    let start = end - Duration::days(30);
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("ticker", DataType::Utf8, false),
-        Field::new("close", DataType::Float64, false),
-    ]));
+    let cache = Cache::new(
+        Box::new(FileCacheStore::new("data/cache", FileFormat::Parquet)),
+        Box::new(YFinanceFetcher::new()?),
+    );
 
-    let tickers: ArrayRef = Arc::new(StringArray::from(vec!["AAPL", "MSFT", "GOOG"]));
+    let batch = cache.get_timeseries_data(symbol, start, end, FetchAction::Missing)?;
+    println!("{symbol}: {} rows", batch.num_rows());
 
-    let closes: ArrayRef = Arc::new(Float64Array::from(vec![150.0, 320.0, 140.0]));
-
-    return RecordBatch::try_new(schema, vec![tickers, closes]);
-}
-
-fn main() {
-    /*
-    let result = add(2, 2);
-    println!("Hello, world!");
-    println!("{}", result);
-     */
-
-    let cache = tabular_cache::new();
-    let start_date = Utc::now();
-    let end_date = Utc::now();
-    let data = cache.get_timeseries_data("Timestamp", start_date, end_date, fetch_yfinance_data);
+    arrow::csv::Writer::new(std::io::stdout()).write(&batch)?;
+    Ok(())
 }

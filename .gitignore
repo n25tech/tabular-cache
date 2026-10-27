@@ -21,3 +21,6 @@ rustc-ice-*.txt
 # Added by cargo
 
 /target
+
+# Local cache written by the yfinance example
+data/
