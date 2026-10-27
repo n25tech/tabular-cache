@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{BooleanArray, Date32Array, RecordBatch};
@@ -34,6 +34,7 @@ pub enum FetchAction {
     /// Fetch the whole requested range, replacing any cached rows for those dates.
     All,
     /// Fetch only the uncached trading days in the requested range (see [`Cache::with_coalesce_gap`]).
+    /// Days already known to have no data (see [`Cache::get_timeseries_data`]) are not fetched again.
     Missing,
 }
 
@@ -41,6 +42,7 @@ pub struct Cache {
     store: Box<dyn CacheStore>,
     fetcher: Box<dyn TimeseriesFetcher>,
     coalesce_gap: usize,
+    now: fn() -> DateTime<Utc>,
 }
 
 impl Cache {
@@ -49,6 +51,7 @@ impl Cache {
             store,
             fetcher,
             coalesce_gap: DEFAULT_COALESCE_GAP,
+            now: Utc::now,
         }
     }
 
@@ -61,7 +64,7 @@ impl Cache {
     }
 
     /// Lists the weekdays in `[start, end]` that have no cached row for `ticker`.
-    /// Weekends are never reported as missing.
+    /// Weekends and days known to have no data are never reported as missing.
     pub fn get_missing_dates(
         &self,
         ticker: &str,
@@ -69,16 +72,21 @@ impl Cache {
         end: DateTime<Utc>,
     ) -> Result<Vec<DateTime<Utc>>, ArrowError> {
         let cached = self.store.read(ticker)?;
-        let missing = missing_days(cached.as_ref(), start.date_naive(), end.date_naive())?;
+        let empty = self.store.read_empty_days(ticker)?;
+        let missing = missing_days(cached.as_ref(), &empty, start.date_naive(), end.date_naive())?;
         Ok(missing.into_iter().map(at_midnight).collect())
     }
 
     /// Returns the rows for `[start, end]`, fetching from the source as dictated by `action`.
     ///
     /// Each fetch is merged into the cache and written back before the next one starts, so a
-    /// failure part-way keeps what was already fetched. Fetches that return no rows (for example
-    /// an exchange holiday) are not written. A failed fetch returns the error rather than
-    /// partial data.
+    /// failure part-way keeps what was already fetched. A failed fetch returns the error rather
+    /// than partial data.
+    ///
+    /// Weekdays in a successful fetch that came back without a row (for example exchange holidays)
+    /// are remembered as empty, so [`FetchAction::Missing`] does not ask for them again. Only days
+    /// before the current UTC date are remembered, since a later day may simply not have closed
+    /// yet. [`FetchAction::All`] fetches empty days again and forgets any that now have data.
     pub fn get_timeseries_data(
         &self,
         ticker: &str,
@@ -88,30 +96,43 @@ impl Cache {
     ) -> Result<RecordBatch, ArrowError> {
         let (start_day, end_day) = (start.date_naive(), end.date_naive());
         let mut table = self.store.read(ticker)?;
+        let mut empty = self.store.read_empty_days(ticker)?;
 
         let windows = match action {
             FetchAction::All if start_day <= end_day => vec![(start_day, end_day)],
             FetchAction::All => Vec::new(),
             FetchAction::Missing => {
-                let missing = missing_days(table.as_ref(), start_day, end_day)?;
+                let missing = missing_days(table.as_ref(), &empty, start_day, end_day)?;
                 fetch_windows(&missing, self.coalesce_gap)
             }
         };
 
+        let today = (self.now)().date_naive();
         for (from, to) in windows {
             let fetched = self
                 .fetcher
                 .fetch(ticker, at_midnight(from), at_midnight(to))?;
-            if fetched.num_rows() == 0 {
-                continue;
+
+            if fetched.num_rows() > 0 {
+                let merged = match &table {
+                    Some(cached) => merge(cached, &fetched)?,
+                    None => fetched,
+                };
+                self.store.write(ticker, &merged)?;
+                table = Some(merged);
             }
 
-            let merged = match &table {
-                Some(cached) => merge(cached, &fetched)?,
-                None => fetched,
+            let present = match &table {
+                Some(table) => cached_days(table)?,
+                None => HashSet::new(),
             };
-            self.store.write(ticker, &merged)?;
-            table = Some(merged);
+            let mut updated: BTreeSet<NaiveDate> =
+                empty.iter().copied().filter(|day| !present.contains(day)).collect();
+            updated.extend(trading_days(from, to).filter(|day| *day < today && !present.contains(day)));
+            if updated != empty {
+                self.store.write_empty_days(ticker, &updated)?;
+                empty = updated;
+            }
         }
 
         match table {
@@ -154,8 +175,16 @@ fn cached_days(batch: &RecordBatch) -> Result<HashSet<NaiveDate>, ArrowError> {
         .collect())
 }
 
+fn trading_days(start: NaiveDate, end: NaiveDate) -> impl Iterator<Item = NaiveDate> {
+    start
+        .iter_days()
+        .take_while(move |day| *day <= end)
+        .filter(|day| is_trading_day(*day))
+}
+
 fn missing_days(
     cached: Option<&RecordBatch>,
+    empty: &BTreeSet<NaiveDate>,
     start: NaiveDate,
     end: NaiveDate,
 ) -> Result<Vec<NaiveDate>, ArrowError> {
@@ -164,15 +193,9 @@ fn missing_days(
         None => HashSet::new(),
     };
 
-    let mut missing = Vec::new();
-    let mut day = start;
-    while day <= end {
-        if is_trading_day(day) && !present.contains(&day) {
-            missing.push(day);
-        }
-        day += Duration::days(1);
-    }
-    Ok(missing)
+    Ok(trading_days(start, end)
+        .filter(|day| !present.contains(day) && !empty.contains(day))
+        .collect())
 }
 
 fn trading_days_between(from: NaiveDate, to: NaiveDate) -> usize {
@@ -258,6 +281,24 @@ mod tests {
         }
     }
 
+    /// Lets a test inspect the store after handing it to a [`Cache`].
+    struct SharedStore(Arc<InMemoryCacheStore>);
+
+    impl CacheStore for SharedStore {
+        fn read(&self, ticker: &str) -> Result<Option<RecordBatch>, ArrowError> {
+            self.0.read(ticker)
+        }
+        fn write(&self, ticker: &str, batch: &RecordBatch) -> Result<(), ArrowError> {
+            self.0.write(ticker, batch)
+        }
+        fn read_empty_days(&self, ticker: &str) -> Result<BTreeSet<NaiveDate>, ArrowError> {
+            self.0.read_empty_days(ticker)
+        }
+        fn write_empty_days(&self, ticker: &str, days: &BTreeSet<NaiveDate>) -> Result<(), ArrowError> {
+            self.0.write_empty_days(ticker, days)
+        }
+    }
+
     fn to_days(day: NaiveDate) -> i32 {
         (day - epoch()).num_days() as i32
     }
@@ -288,7 +329,7 @@ mod tests {
 
     #[test]
     fn weekends_are_not_reported_missing() {
-        let missing = missing_days(None, day(2026, 6, 1), day(2026, 6, 7)).unwrap();
+        let missing = missing_days(None, &BTreeSet::new(), day(2026, 6, 1), day(2026, 6, 7)).unwrap();
         let expected: Vec<_> = (1..=5).map(|d| day(2026, 6, d)).collect();
         assert_eq!(missing, expected);
     }
@@ -296,8 +337,31 @@ mod tests {
     #[test]
     fn cached_days_are_not_reported_missing() {
         let cached = batch_for(&[day(2026, 6, 1), day(2026, 6, 3)], 1.0);
-        let missing = missing_days(Some(&cached), day(2026, 6, 1), day(2026, 6, 5)).unwrap();
+        let missing = missing_days(Some(&cached), &BTreeSet::new(), day(2026, 6, 1), day(2026, 6, 5)).unwrap();
         assert_eq!(missing, vec![day(2026, 6, 2), day(2026, 6, 4), day(2026, 6, 5)]);
+    }
+
+    #[test]
+    fn empty_days_are_not_reported_missing() {
+        let empty = BTreeSet::from([day(2026, 6, 2)]);
+        let missing = missing_days(None, &empty, day(2026, 6, 1), day(2026, 6, 3)).unwrap();
+        assert_eq!(missing, vec![day(2026, 6, 1), day(2026, 6, 3)]);
+    }
+
+    #[test]
+    fn days_from_the_current_utc_date_on_are_not_remembered_as_empty() {
+        let store = Arc::new(InMemoryCacheStore::new());
+        let mut cache = Cache::new(Box::new(SharedStore(store.clone())), Box::new(NoopFetcher));
+        cache.now = || Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+
+        cache
+            .get_timeseries_data("TEST", utc(2026, 6, 1), utc(2026, 6, 5), FetchAction::Missing)
+            .unwrap();
+
+        assert_eq!(
+            store.read_empty_days("TEST").unwrap(),
+            BTreeSet::from([day(2026, 6, 1), day(2026, 6, 2)])
+        );
     }
 
     #[test]

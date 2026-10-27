@@ -93,23 +93,30 @@ fn empty_fetch_then_data(format: FileFormat, name: &str) {
         .unwrap();
     assert_eq!(batch.num_rows(), 0);
     assert!(!dir.join(format!("AAPL.{}", if format == FileFormat::Csv { "csv" } else { "parquet" })).exists());
+    assert!(dir.join("AAPL.empty-days").exists());
 
-    let (fetcher, _) = MockFetcher::new();
-    let batch = Cache::new(Box::new(FileCacheStore::new(&dir, format)), Box::new(fetcher))
-        .get_timeseries_data("AAPL", start, end, FetchAction::Missing)
-        .unwrap();
+    // A fresh cache over the same directory remembers the empty days and does not fetch them.
+    let (fetcher, calls) = MockFetcher::new();
+    let cache = Cache::new(Box::new(FileCacheStore::new(&dir, format)), Box::new(fetcher));
+    let batch = cache.get_timeseries_data("AAPL", start, end, FetchAction::Missing).unwrap();
+    assert_eq!(batch.num_rows(), 0);
+    assert!(calls.lock().unwrap().is_empty());
+
+    // FetchAction::All asks again, and forgets the days once they have data.
+    let batch = cache.get_timeseries_data("AAPL", start, end, FetchAction::All).unwrap();
     assert_eq!(batch.num_rows(), 5);
+    assert!(!dir.join("AAPL.empty-days").exists());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn csv_cache_recovers_after_an_empty_fetch() {
+fn csv_cache_remembers_an_empty_fetch_until_fetch_all() {
     empty_fetch_then_data(FileFormat::Csv, "csv-empty");
 }
 
 #[test]
-fn parquet_cache_recovers_after_an_empty_fetch() {
+fn parquet_cache_remembers_an_empty_fetch_until_fetch_all() {
     empty_fetch_then_data(FileFormat::Parquet, "parquet-empty");
 }
 

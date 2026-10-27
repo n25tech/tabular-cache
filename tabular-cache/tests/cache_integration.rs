@@ -1,6 +1,6 @@
 mod common;
 
-use common::{MockFetcher, dates_of, days_since_epoch, utc};
+use common::{MockFetcher, dates_of, day, days_since_epoch, utc};
 use tabular_cache::{Cache, FetchAction, InMemoryCacheStore};
 
 fn cache_with_mock() -> (Cache, common::Calls) {
@@ -152,14 +152,49 @@ fn rows_fetched_before_a_failure_are_kept() {
 }
 
 #[test]
-fn empty_fetch_returns_no_rows_and_leaves_the_days_missing() {
+fn empty_fetch_returns_no_rows_and_is_not_repeated() {
     let (fetcher, calls) = MockFetcher::empty();
     let cache = Cache::new(Box::new(InMemoryCacheStore::new()), Box::new(fetcher));
     let (start, end) = (utc(2026, 6, 1), utc(2026, 6, 5));
 
     let batch = cache.get_timeseries_data("AAPL", start, end, FetchAction::Missing).unwrap();
-
     assert_eq!(batch.num_rows(), 0);
+    assert!(cache.get_missing_dates("AAPL", start, end).unwrap().is_empty());
+
+    cache.get_timeseries_data("AAPL", start, end, FetchAction::Missing).unwrap();
     assert_eq!(calls.lock().unwrap().len(), 1);
-    assert_eq!(cache.get_missing_dates("AAPL", start, end).unwrap().len(), 5);
+}
+
+#[test]
+fn holidays_are_remembered_and_not_fetched_again() {
+    let (fetcher, calls) = MockFetcher::with_holidays(&[day(2026, 6, 3)]);
+    let cache = Cache::new(Box::new(InMemoryCacheStore::new()), Box::new(fetcher));
+    let (start, end) = (utc(2026, 6, 1), utc(2026, 6, 5));
+
+    let batch = cache.get_timeseries_data("AAPL", start, end, FetchAction::Missing).unwrap();
+    assert_eq!(batch.num_rows(), 4);
+    assert!(cache.get_missing_dates("AAPL", start, end).unwrap().is_empty());
+
+    // Extending the range fetches only the new days, not the holiday.
+    cache
+        .get_timeseries_data("AAPL", start, utc(2026, 6, 8), FetchAction::Missing)
+        .unwrap();
+    let calls = calls.lock().unwrap();
+    assert_eq!(*calls, vec![(start, end), (utc(2026, 6, 8), utc(2026, 6, 8))]);
+}
+
+#[test]
+fn days_known_to_be_empty_do_not_join_coalesced_windows() {
+    let (fetcher, calls) = MockFetcher::with_holidays(&[day(2026, 6, 1)]);
+    let cache = Cache::new(Box::new(InMemoryCacheStore::new()), Box::new(fetcher)).with_coalesce_gap(0);
+
+    cache
+        .get_timeseries_data("AAPL", utc(2026, 6, 1), utc(2026, 6, 5), FetchAction::Missing)
+        .unwrap();
+    calls.lock().unwrap().clear();
+
+    cache
+        .get_timeseries_data("AAPL", utc(2026, 6, 1), utc(2026, 6, 8), FetchAction::Missing)
+        .unwrap();
+    assert_eq!(*calls.lock().unwrap(), vec![(utc(2026, 6, 8), utc(2026, 6, 8))]);
 }

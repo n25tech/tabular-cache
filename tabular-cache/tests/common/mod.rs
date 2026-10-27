@@ -16,6 +16,8 @@ pub struct MockFetcher {
     pub empty: bool,
     /// Fail on this (1-based) call number.
     pub fail_on_call: Option<usize>,
+    /// Weekdays with no row, like exchange holidays.
+    pub holidays: Vec<NaiveDate>,
 }
 
 impl MockFetcher {
@@ -26,6 +28,7 @@ impl MockFetcher {
                 calls: calls.clone(),
                 empty: false,
                 fail_on_call: None,
+                holidays: Vec::new(),
             },
             calls,
         )
@@ -34,6 +37,12 @@ impl MockFetcher {
     pub fn empty() -> (Self, Calls) {
         let (mut fetcher, calls) = Self::new();
         fetcher.empty = true;
+        (fetcher, calls)
+    }
+
+    pub fn with_holidays(holidays: &[NaiveDate]) -> (Self, Calls) {
+        let (mut fetcher, calls) = Self::new();
+        fetcher.holidays = holidays.to_vec();
         (fetcher, calls)
     }
 
@@ -64,6 +73,9 @@ impl TimeseriesFetcher for MockFetcher {
             Vec::new()
         } else {
             weekdays(start.date_naive(), end.date_naive())
+                .into_iter()
+                .filter(|day| !self.holidays.contains(day))
+                .collect()
         };
         let n = days.len();
         let closes: Vec<f64> = days.iter().map(|d| 100.0 + d.day() as f64).collect();
@@ -96,6 +108,10 @@ pub fn weekdays(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
 
 pub fn days_since_epoch(day: NaiveDate) -> i32 {
     (day - NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32
+}
+
+pub fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(y, m, d).unwrap()
 }
 
 pub fn utc(y: i32, m: u32, d: u32) -> DateTime<Utc> {
